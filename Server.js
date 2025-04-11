@@ -1,3 +1,4 @@
+
 require('dotenv').config();
 const express = require('express');
 const speakeasy = require('speakeasy');
@@ -5,12 +6,11 @@ const bcrypt = require('bcrypt');
 const cors = require('cors');
 const jwt = require('jsonwebtoken');
 const { initializeApp } = require('firebase/app');
-
-
 const nodemailer = require('nodemailer');
 const crypto = require('crypto');
+const paypal = require('@paypal/checkout-server-sdk');
 
-// Configurar transporter de nodemailer (agregar después de firebaseConfig)
+// Configurar transporter de nodemailer
 const transporter = nodemailer.createTransport({
   service: 'Gmail',
   auth: {
@@ -18,6 +18,7 @@ const transporter = nodemailer.createTransport({
     pass: process.env.EMAIL_PASSWORD,
   },
 });
+
 const { 
   getFirestore, 
   collection, 
@@ -28,9 +29,10 @@ const {
   where, 
   getDocs,
   deleteDoc,
-  updateDoc 
+  updateDoc,
+  increment
 } = require('firebase/firestore');
-// Añadir al inicio del server.js
+
 const JWT_SECRET = process.env.JWT_SECRET;
 
 // Configuración Firebase usando variables de entorno
@@ -48,26 +50,40 @@ const firebaseConfig = {
 const firebaseApp = initializeApp(firebaseConfig);
 const db = getFirestore(firebaseApp);
 
+// Configuración de PayPal
+let paypalEnvironment;
+if (process.env.NODE_ENV === 'production') {
+  paypalEnvironment = new paypal.core.LiveEnvironment(
+    process.env.PAYPAL_CLIENT_ID,
+    process.env.PAYPAL_CLIENT_SECRET
+  );
+} else {
+  paypalEnvironment = new paypal.core.SandboxEnvironment(
+    process.env.PAYPAL_CLIENT_ID,
+    process.env.PAYPAL_CLIENT_SECRET
+  );
+}
+const paypalClient = new paypal.core.PayPalHttpClient(paypalEnvironment);
+
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Validaciones
-const validateUsername = (username) => /^[a-zA-Z0-9]{3,20}$/.test(username);
-const validatePassword = (password) => /^(?=.*[A-Z])(?=.*\d).{8,}$/.test(password);
-
-// Endpoints
-app.post('/api/auth/check-username', async (req, res) => {
+// Middleware de autenticación
+const authenticateToken = (req, res, next) => {
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1];
+  
+  if (!token) return res.status(401).json({ error: 'Acceso denegado' });
+  
   try {
-    const { username } = req.body;
-    const usersRef = collection(db, 'users');
-    const q = query(usersRef, where('username', '==', username));
-    const snapshot = await getDocs(q);
-    res.json({ available: snapshot.empty });
+    const verified = jwt.verify(token, JWT_SECRET);
+    req.user = verified;
+    next();
   } catch (error) {
-    res.status(500).json({ error: 'Error al verificar usuario' });
+    res.status(403).json({ error: 'Token inválido' });
   }
-});
+};
 app.post('/api/auth/check-email', async (req, res) => {
   const { email } = req.body;
   const usersRef = collection(db, 'users');
@@ -397,3 +413,185 @@ app.put('/api/auth/update-username', async (req, res) => {
       res.status(500).json({ error: 'Error actualizando usuario' });
   }
 });
+app.post('/api/payments/create-order', authenticateToken, async (req, res) => {
+  try {
+    const { paqueteId } = req.body;
+    
+    // Mapeo de paquetes (misma estructura que tu frontend)
+    const paquetes = [
+      { id: 0, fichas: 100, precio: 5.00 },
+      { id: 1, fichas: 250, precio: 10.00 },
+      { id: 2, fichas: 500, precio: 20.00 },
+      { id: 3, fichas: 1000, precio: 35.00 },
+      { id: 4, fichas: 2500, precio: 75.00 },
+      { id: 5, fichas: 5000, precio: 120.00 }
+    ];
+    
+    const paquete = paquetes[paqueteId];
+    
+    if (!paquete) {
+      return res.status(400).json({ error: 'Paquete no válido' });
+    }
+    
+    const request = new paypal.orders.OrdersCreateRequest();
+    request.prefer("return=representation");
+    request.requestBody({
+      intent: 'CAPTURE',
+      purchase_units: [{
+        description: `${paquete.fichas} Fichas para El Dado de Oro`,
+        amount: {
+          currency_code: 'USD',
+          value: paquete.precio.toFixed(2)
+        },
+        custom_id: `${req.user.userId}|${paqueteId}`
+      }]
+    });
+    
+    const order = await paypalClient.execute(request);
+    
+    // Guardar información de la orden en Firestore
+    const orderData = {
+      userId: req.user.userId,
+      paqueteId: paqueteId,
+      fichas: paquete.fichas,
+      monto: paquete.precio,
+      status: 'CREATED',
+      createdAt: new Date().toISOString(),
+      paypalOrderId: order.result.id
+    };
+    
+    await setDoc(doc(db, 'orders', order.result.id), orderData);
+    
+    res.json({
+      orderId: order.result.id,
+      status: order.result.status
+    });
+  } catch (error) {
+    console.error('Error creando orden:', error);
+    res.status(500).json({ error: 'Error al crear la orden' });
+  }
+});
+
+// Capturar un pago completado
+app.post('/api/payments/capture-order', authenticateToken, async (req, res) => {
+  try {
+    const { orderId } = req.body;
+    
+    // Verificar que la orden existe en nuestra base de datos
+    const orderRef = doc(db, 'orders', orderId);
+    const orderSnap = await getDoc(orderRef);
+    
+    if (!orderSnap.exists()) {
+      return res.status(404).json({ error: 'Orden no encontrada' });
+    }
+    
+    const orderData = orderSnap.data();
+    
+    // Verificar que el usuario es el propietario de la orden
+    if (orderData.userId !== req.user.userId) {
+      return res.status(403).json({ error: 'No autorizado' });
+    }
+    
+    // Capturar la orden en PayPal
+    const request = new paypal.orders.OrdersCaptureRequest(orderId);
+    request.requestBody({});
+    
+    const capture = await paypalClient.execute(request);
+    
+    // Actualizar estado de la orden
+    await updateDoc(orderRef, {
+      status: 'COMPLETED',
+      completedAt: new Date().toISOString(),
+      paypalDetails: capture.result
+    });
+    
+    // Añadir fichas al usuario
+    const userRef = doc(db, 'users', req.user.userId);
+    await updateDoc(userRef, {
+      fichas: increment(orderData.fichas)
+    });
+    
+    // Crear registro de transacción
+    const transactionId = `txn_${Date.now()}`;
+    await setDoc(doc(db, 'transactions', transactionId), {
+      userId: req.user.userId,
+      orderId: orderId,
+      fichas: orderData.fichas,
+      tipo: 'COMPRA',
+      monto: orderData.monto,
+      fecha: new Date().toISOString()
+    });
+    
+    res.json({
+      success: true,
+      fichasAñadidas: orderData.fichas,
+      message: 'Pago completado con éxito'
+    });
+  } catch (error) {
+    console.error('Error capturando orden:', error);
+    res.status(500).json({ error: 'Error al procesar el pago' });
+  }
+});
+
+// Obtener el saldo de fichas del usuario
+app.get('/api/user/fichas', authenticateToken, async (req, res) => {
+  try {
+    const userRef = doc(db, 'users', req.user.userId);
+    const userSnap = await getDoc(userRef);
+    
+    if (!userSnap.exists()) {
+      return res.status(404).json({ error: 'Usuario no encontrado' });
+    }
+    
+    const userData = userSnap.data();
+    
+    // Si el campo fichas no existe, inicializarlo a 0
+    const fichas = userData.fichas || 0;
+    
+    res.json({ fichas });
+  } catch (error) {
+    console.error('Error obteniendo fichas:', error);
+    res.status(500).json({ error: 'Error al obtener saldo de fichas' });
+  }
+});
+
+// Endpoint para obtener historial de transacciones
+app.get('/api/user/transactions', authenticateToken, async (req, res) => {
+  try {
+    const transactionsRef = collection(db, 'transactions');
+    const q = query(transactionsRef, where('userId', '==', req.user.userId));
+    const querySnapshot = await getDocs(q);
+    
+    const transactions = [];
+    querySnapshot.forEach((doc) => {
+      transactions.push({
+        id: doc.id,
+        ...doc.data()
+      });
+    });
+    
+    // Ordenar por fecha, más reciente primero
+    transactions.sort((a, b) => new Date(b.fecha) - new Date(a.fecha));
+    
+    res.json({ transactions });
+  } catch (error) {
+    console.error('Error obteniendo transacciones:', error);
+    res.status(500).json({ error: 'Error al obtener historial de transacciones' });
+  }
+});
+
+
+
+// Verificación de conexión a Firebase
+testFirebaseConnection();
+
+async function testFirebaseConnection() {
+  try {
+    const testDocRef = doc(db, '_test', 'connection');
+    await setDoc(testDocRef, { test: new Date() });
+    await deleteDoc(testDocRef);
+    console.log('Conexión a Firebase establecida correctamente');
+  } catch (error) {
+    console.error('Fallo la conexión con Firebase:', error.message);
+  }
+}
