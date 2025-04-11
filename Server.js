@@ -5,6 +5,19 @@ const bcrypt = require('bcrypt');
 const cors = require('cors');
 const jwt = require('jsonwebtoken');
 const { initializeApp } = require('firebase/app');
+
+
+const nodemailer = require('nodemailer');
+const crypto = require('crypto');
+
+// Configurar transporter de nodemailer (agregar después de firebaseConfig)
+const transporter = nodemailer.createTransport({
+  service: 'Gmail',
+  auth: {
+    user: process.env.EMAIL_USER,
+    pass: process.env.EMAIL_PASSWORD,
+  },
+});
 const { 
   getFirestore, 
   collection, 
@@ -14,7 +27,8 @@ const {
   query, 
   where, 
   getDocs,
-  deleteDoc 
+  deleteDoc,
+  updateDoc 
 } = require('firebase/firestore');
 // Añadir al inicio del server.js
 const JWT_SECRET = process.env.JWT_SECRET;
@@ -226,3 +240,94 @@ async function testFirebaseConnection() {
     console.error('Fallo la conexión con Firebase:', error.message);
   }
 }
+app.post('/api/auth/forgot-password', async (req, res) => {
+  const { email } = req.body;
+  try {
+    const userRef = doc(db, 'users', email);
+    const userSnap = await getDoc(userRef);
+    
+    if (!userSnap.exists()) {
+      return res.status(404).json({ error: 'No existe una cuenta con este correo' });
+    }
+
+    const code = crypto.randomInt(100000, 999999).toString();
+    const expiresAt = new Date(Date.now() + 600000); // 10 minutos
+
+    const resetRef = doc(db, 'passwordResets', email);
+    await setDoc(resetRef, { 
+      code, 
+      expiresAt: expiresAt.toISOString() // Guardar como string ISO
+    });
+
+    await transporter.sendMail({
+      from: `Casino Dorado <${process.env.EMAIL_USER}>`,
+      to: email,
+      subject: 'Código de recuperación de contraseña',
+      html: `<p>Tu código de verificación es: <strong>${code}</strong></p>
+             <p>Este código expirará en 10 minutos.</p>`
+    });
+
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Error en forgot-password:', error);
+    res.status(500).json({ error: 'Error al procesar la solicitud' });
+  }
+});
+
+app.post('/api/auth/reset-password', async (req, res) => {
+  const { email, code, newPassword } = req.body;
+  
+  console.log('Datos recibidos:', { email, code, newPassword });
+
+  try {
+    // Validar nueva contraseña
+    if (!validatePassword(newPassword)) {
+      return res.status(400).json({ error: 'La contraseña debe tener al menos 8 caracteres, una mayúscula y un número' });
+    }
+
+    const resetRef = doc(db, 'passwordResets', email);
+    const resetSnap = await getDoc(resetRef);
+
+    if (!resetSnap.exists()) {
+      return res.status(400).json({ error: 'Código inválido o expirado' });
+    }
+
+    const { code: storedCode, expiresAt } = resetSnap.data();
+    const now = new Date();
+    const expirationDate = new Date(expiresAt); // Convertir string ISO a Date
+
+    console.log('Comparando:', {
+      storedCode,
+      receivedCode: code,
+      expiresAt: expirationDate.toISOString(),
+      now: now.toISOString()
+    });
+
+    if (storedCode !== code || now > expirationDate) {
+      return res.status(400).json({ error: 'Código inválido o expirado' });
+    }
+
+    const hashedPassword = await bcrypt.hash(newPassword, 10);
+    const userRef = doc(db, 'users', email);
+    
+    await updateDoc(userRef, { 
+      password: hashedPassword 
+    });
+    
+    await deleteDoc(resetRef);
+
+    res.json({ 
+      success: true,
+      message: 'Contraseña actualizada correctamente' 
+    });
+  } catch (error) {
+    console.error('Error detallado en reset-password:', {
+      message: error.message,
+      stack: error.stack
+    });
+    res.status(500).json({ 
+      error: 'Error al actualizar la contraseña',
+      details: error.message
+    });
+  }
+});
