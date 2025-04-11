@@ -260,7 +260,7 @@ app.post('/api/auth/forgot-password', async (req, res) => {
     });
 
     await transporter.sendMail({
-      from: `Casino Dorado <${process.env.EMAIL_USER}>`,
+      from: `El dado de oro <${process.env.EMAIL_USER}>`,
       to: email,
       subject: 'Código de recuperación de contraseña',
       html: `<p>Tu código de verificación es: <strong>${code}</strong></p>
@@ -329,5 +329,71 @@ app.post('/api/auth/reset-password', async (req, res) => {
       error: 'Error al actualizar la contraseña',
       details: error.message
     });
+  }
+});
+// Agrega este nuevo endpoint antes del app.listen
+app.get('/api/auth/user', async (req, res) => {
+  try {
+      const token = req.headers.authorization?.split(' ')[1];
+      if (!token) return res.status(401).json({ error: 'Acceso no autorizado' });
+
+      const decoded = jwt.verify(token, JWT_SECRET);
+      const userRef = doc(db, 'users', decoded.userId);
+      const userSnap = await getDoc(userRef);
+
+      if (!userSnap.exists()) {
+          return res.status(404).json({ error: 'Usuario no encontrado' });
+      }
+
+      const userData = userSnap.data();
+      res.json({
+          username: userData.username,
+          email: userData.email,
+          verified: userData.verified,
+          mfaEnabled: userData.mfaEnabled,
+          createdAt: userData.createdAt
+      });
+      
+  } catch (error) {
+      console.error('Error en /api/auth/user:', error);
+      res.status(500).json({ error: 'Error al obtener datos del usuario' });
+  }
+});
+app.put('/api/auth/update-username', async (req, res) => {
+  try {
+      const token = req.headers.authorization?.split(' ')[1];
+      if (!token) return res.status(401).json({ error: 'No autorizado' });
+
+      const decoded = jwt.verify(token, JWT_SECRET);
+      const { newUsername } = req.body;
+
+      // Validaciones
+      if (!validateUsername(newUsername)) {
+          return res.status(400).json({ error: 'Nombre de usuario inválido' });
+      }
+
+      // Verificar disponibilidad
+      const usersRef = collection(db, 'users');
+      const q = query(usersRef, where('username', '==', newUsername));
+      const snapshot = await getDocs(q);
+      
+      if (!snapshot.empty) {
+          return res.status(400).json({ error: 'Nombre de usuario ya está en uso' });
+      }
+
+      // Actualizar en Firestore
+      const userRef = doc(db, 'users', decoded.userId);
+      await updateDoc(userRef, { 
+          username: newUsername 
+      });
+
+      res.json({ 
+          success: true,
+          newUsername 
+      });
+
+  } catch (error) {
+      console.error('Error actualizando username:', error);
+      res.status(500).json({ error: 'Error actualizando usuario' });
   }
 });
