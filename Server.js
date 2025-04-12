@@ -682,3 +682,86 @@ app.post('/api/user/add-fichas', authenticateToken, async (req, res) => {
     res.status(500).json({ error: 'Error al añadir fichas' });
   }
 });
+// Endpoint para canjear productos
+app.post('/api/user/canjear-producto', authenticateToken, async (req, res) => {
+  try {
+    const { productoId, precioFichas } = req.body;
+    
+    // Validar datos de entrada
+    if (!productoId || !precioFichas || precioFichas <= 0) {
+      return res.status(400).json({ error: 'Datos de canje inválidos' });
+    }
+
+    // Obtener usuario
+    const userRef = doc(db, 'users', req.user.userId);
+    const userSnap = await getDoc(userRef);
+    
+    if (!userSnap.exists()) {
+      return res.status(404).json({ error: 'Usuario no encontrado' });
+    }
+
+    const userData = userSnap.data();
+    const fichasActuales = userData.fichas || 0;
+
+    // Verificar fichas suficientes
+    if (fichasActuales < precioFichas) {
+      return res.status(400).json({ error: 'Fichas insuficientes' });
+    }
+
+    // Lista de productos válidos (deberías mover esto a una colección de Firestore)
+    const productosValidos = [
+      { id: 1, nombre: "Teclado Gaming RGB", precio: 500 },
+      { id: 2, nombre: "Auriculares Gaming", precio: 300 },
+      { id: 3, nombre: "Mousepad XL", precio: 150 }
+    ];
+
+    // Validar producto
+    const producto = productosValidos.find(p => p.id === productoId);
+    if (!producto || producto.precio !== precioFichas) {
+      return res.status(400).json({ error: 'Producto no válido' });
+    }
+
+    // Actualizar fichas
+    const nuevasFichas = fichasActuales - precioFichas;
+    await updateDoc(userRef, {
+      fichas: nuevasFichas
+    });
+
+    // Registrar transacción
+    const transactionId = `canje_${Date.now()}`;
+    await setDoc(doc(db, 'transactions', transactionId), {
+      userId: req.user.userId,
+      tipo: 'CANJE',
+      productoId: productoId,
+      fichas: -precioFichas,
+      detalles: {
+        nombreProducto: producto.nombre,
+        precio: producto.precio
+      },
+      fecha: new Date().toISOString()
+    });
+
+    // Registrar canje en nueva colección
+    const redemptionId = `red_${Date.now()}`;
+    await setDoc(doc(db, 'redemptions', redemptionId), {
+      userId: req.user.userId,
+      productoId: productoId,
+      fechaCanje: new Date().toISOString(),
+      estado: 'PENDIENTE',
+      detallesEnvio: {
+        direccion: 'Por definir', // Deberías recolectar esta info
+        tracking: null
+      }
+    });
+
+    res.json({ 
+      success: true,
+      fichasRestantes: nuevasFichas,
+      mensaje: `Canje exitoso: ${producto.nombre}`
+    });
+
+  } catch (error) {
+    console.error('Error en canje:', error);
+    res.status(500).json({ error: 'Error al procesar el canje' });
+  }
+});
