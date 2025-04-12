@@ -114,6 +114,7 @@ app.post('/api/auth/register', async (req, res) => {
     mfaSecret: secret.base32,
     verified: false,
     createdAt: new Date()
+    
   };
 
   await setDoc(doc(db, 'tempUsers', email), tempUser);
@@ -142,7 +143,8 @@ app.post('/api/auth/verify-registration', async (req, res) => {
           ...tempUser, 
           verified: true,
           mfaEnabled: true,
-          mfaSecret: tempUser.mfaSecret
+          mfaSecret: tempUser.mfaSecret,
+          fichas: 0
       });
       await deleteDoc(tempUserRef);
       res.json({ success: true });
@@ -544,14 +546,12 @@ app.get('/api/user/fichas', authenticateToken, async (req, res) => {
     }
     
     const userData = userSnap.data();
-    
-    // Si el campo fichas no existe, inicializarlo a 0
-    const fichas = userData.fichas || 0;
-    
-    res.json({ fichas });
+    res.json({ 
+      fichas: Number(userData.fichas) || 0 // Asegurar número y valor por defecto
+    });
   } catch (error) {
     console.error('Error obteniendo fichas:', error);
-    res.status(500).json({ error: 'Error al obtener saldo de fichas' });
+    res.json({ fichas: 0 }); // Respuesta segura incluso en errores
   }
 });
 
@@ -595,3 +595,90 @@ async function testFirebaseConnection() {
     console.error('Fallo la conexión con Firebase:', error.message);
   }
 }
+// En tu server.js (backend)
+// Añadir esto al archivo server.js antes del app.listen()
+
+// Endpoint para deducir fichas
+app.post('/api/user/deduct-fichas', authenticateToken, async (req, res) => {
+  try {
+    const { amount } = req.body;
+    
+    if (!amount || amount <= 0) {
+      return res.status(400).json({ error: 'Cantidad inválida' });
+    }
+    
+    const userRef = doc(db, 'users', req.user.userId);
+    const userSnap = await getDoc(userRef);
+    
+    if (!userSnap.exists()) {
+      return res.status(404).json({ error: 'Usuario no encontrado' });
+    }
+    
+    const userData = userSnap.data();
+    const currentFichas = userData.fichas || 0;
+    
+    if (currentFichas < amount) {
+      return res.status(400).json({ error: 'Fichas insuficientes' });
+    }
+    
+    const newFichas = currentFichas - amount;
+    
+    await updateDoc(userRef, {
+      fichas: newFichas
+    });
+    
+    // Registrar transacción
+    const transactionId = `txn_${Date.now()}`;
+    await setDoc(doc(db, 'transactions', transactionId), {
+      userId: req.user.userId,
+      fichas: -amount,
+      tipo: 'JUEGO',
+      fecha: new Date().toISOString()
+    });
+    
+    res.json({ fichas: newFichas });
+  } catch (error) {
+    console.error('Error deduciendo fichas:', error);
+    res.status(500).json({ error: 'Error al deducir fichas' });
+  }
+});
+
+// Endpoint para añadir fichas (nuevo)
+app.post('/api/user/add-fichas', authenticateToken, async (req, res) => {
+  try {
+    const { amount } = req.body;
+    
+    if (!amount || amount <= 0) {
+      return res.status(400).json({ error: 'Cantidad inválida' });
+    }
+    
+    const userRef = doc(db, 'users', req.user.userId);
+    const userSnap = await getDoc(userRef);
+    
+    if (!userSnap.exists()) {
+      return res.status(404).json({ error: 'Usuario no encontrado' });
+    }
+    
+    const userData = userSnap.data();
+    const currentFichas = userData.fichas || 0;
+    const newFichas = currentFichas + amount;
+    
+    await updateDoc(userRef, {
+      fichas: newFichas
+    });
+    
+    // Registrar transacción
+    const transactionId = `txn_${Date.now()}`;
+    await setDoc(doc(db, 'transactions', transactionId), {
+      userId: req.user.userId,
+      fichas: amount,
+      tipo: 'PREMIO',
+      fecha: new Date().toISOString()
+    });
+    
+    res.json({ fichas: newFichas });
+  } catch (error) {
+    console.error('Error añadiendo fichas:', error);
+    res.status(500).json({ error: 'Error al añadir fichas' });
+  }
+});
