@@ -765,3 +765,29 @@ app.post('/api/user/canjear-producto', authenticateToken, async (req, res) => {
     res.status(500).json({ error: 'Error al procesar el canje' });
   }
 });
+// Agregar en server.js después del endpoint de check-email
+app.post('/api/auth/check-username', async (req, res) => {
+  const { username } = req.body;
+  
+  // Verificar en ambas colecciones (users y tempUsers)
+  const usersRef = collection(db, 'users');
+  const qUsers = query(usersRef, where('username', '==', username));
+  const snapshotUsers = await getDocs(qUsers);
+
+  const tempUsersRef = collection(db, 'tempUsers');
+  const qTempUsers = query(tempUsersRef, where('username', '==', username));
+  const snapshotTempUsers = await getDocs(qTempUsers);
+
+  const isAvailable = snapshotUsers.empty && snapshotTempUsers.empty;
+  
+  res.json({ available: isAvailable });
+});
+
+// Agregar funciones de validación (antes de los endpoints)
+function validateUsername(username) {
+  return /^[a-zA-Z0-9]{3,20}$/.test(username);
+}
+
+function validatePassword(password) {
+  return /^(?=.*[A-Z])(?=.*\d).{8,}$/.test(password);
+}
